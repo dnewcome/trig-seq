@@ -1,0 +1,7 @@
+[project]
+name = "trig-seq"
+description = "MIDI DJ deck sequencer — fixed playhead, scrolling piano roll, two decks, crossfader"
+
+[devlog]
+version = "local"
+source = "https://github.com/dnewcome/devlog-tools"
