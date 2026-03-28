@@ -1,0 +1,935 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Trig Seq</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #080810;
+  color: #b0b0c0;
+  font-family: 'Courier New', monospace;
+  overflow: hidden;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  user-select: none;
+}
+#canvas-wrap { flex: 1; position: relative; min-height: 0; }
+canvas { display: block; }
+#statusbar {
+  height: 22px;
+  background: #12121e;
+  border-top: 1px solid #1e1e30;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  gap: 18px;
+  font-size: 11px;
+}
+#cmdline {
+  height: 26px;
+  background: #0c0c14;
+  border-top: 1px solid #181824;
+  display: flex;
+  align-items: center;
+  padding: 0 10px;
+  font-size: 12px;
+  gap: 8px;
+}
+.s-mode { color: #7fdbca; font-weight: bold; min-width: 72px; }
+.s-bpm  { color: #ffd700; }
+.s-beat { color: #888; }
+.s-rec  { color: #ff4444; font-weight: bold; }
+.s-hint { color: #444; margin-left: auto; font-size: 10px; }
+#cmd-prefix { color: #7fdbca; }
+#cmd-text   { color: #aaa; }
+</style>
+</head>
+<body>
+<div id="canvas-wrap">
+  <canvas id="c"></canvas>
+</div>
+<div id="statusbar">
+  <span class="s-mode" id="s-mode">PERFORM</span>
+  <span class="s-bpm"  id="s-bpm">120 BPM</span>
+  <span id="s-decks">A:--- B:---</span>
+  <span class="s-beat" id="s-beat">--</span>
+  <span id="s-rec" class="s-rec" style="display:none">● REC</span>
+  <span class="s-hint">SPC:play  R:rec  1-8:toggle clip  Q-I:trigger  A/B:crossfade snap  E:edit  ?:help</span>
+</div>
+<div id="cmdline">
+  <span id="cmd-prefix">-- PERFORM --</span>
+  <span id="cmd-text"></span>
+</div>
+
+<script>
+// ============================================================
+//  TRIG SEQ  — fixed-playhead piano-roll clip sequencer
+// ============================================================
+
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+
+// ------ CONFIG -----------------------------------------------
+const PLAYHEAD_X_RATIO = 0.18;
+const PPB      = 80;   // pixels per beat
+const FADER_H  = 28;   // crossfader strip height
+const LIB_H    = 58;   // clip library strip height
+const PIANO_W  = 14;   // piano key column width
+const LABEL_H  = 17;   // deck label strip at top of each deck
+const MIN_ROW_H = 3;   // minimum row height in px
+const MAX_ROWS  = 72;  // max rows visible before clamping range
+
+const NOTE_COLS = [
+  '#e74c3c','#e67e22','#f1c40f','#2ecc71',
+  '#1abc9c','#3498db','#9b59b6','#e91e63',
+  '#ff5722','#00bcd4','#8bc34a','#ff9800'
+];
+const BLACK_KEYS = new Set([1,3,6,8,10]);
+
+// ------ STATE ------------------------------------------------
+const S = {
+  bpm: 120,
+  playing: false,
+  recording: false,
+  beat: 0,
+  lastTs: null,
+
+  mode: 'perform', // perform | edit | record | command
+
+  clips: [],
+
+  decks: [
+    { clips: new Set([0]), offset: 0 },
+    { clips: new Set([1]), offset: 0 },
+  ],
+  activeDeck: 0,
+
+  fader: 0.5, // 0=full A, 1=full B
+
+  editClip: 0,
+  curBeat: 0,
+  curPitch: 60,
+  quantize: 0.25,
+
+  midiOut: null,
+  cmdBuf: '',
+  scheduled: new Set(),
+  schedHead: 0,
+};
+
+// ------ CLIPS ------------------------------------------------
+let _clipId = 0;
+function mkClip(name, length) {
+  return { id: _clipId++, name, length, notes: [] };
+}
+
+function initClips() {
+  const kick = mkClip('kick', 16);
+  [0,4,8,12].forEach(b => kick.notes.push({beat:b,pitch:36,dur:0.4,vel:100}));
+
+  const snare = mkClip('snare', 16);
+  [4,12].forEach(b => snare.notes.push({beat:b,pitch:38,dur:0.4,vel:90}));
+
+  const hh = mkClip('hh', 16);
+  [0,2,4,6,8,10,12,14].forEach(b => hh.notes.push({beat:b,pitch:42,dur:0.2,vel:65}));
+
+  const bass = mkClip('bass', 16);
+  [{b:0,p:48},{b:1.5,p:48},{b:3,p:50},{b:4,p:53},{b:6,p:48},
+   {b:8,p:48},{b:10,p:46},{b:12,p:45}]
+    .forEach(({b,p}) => bass.notes.push({beat:b,pitch:p,dur:1,vel:85}));
+
+  const mel = mkClip('melody', 16);
+  [{b:0,p:60},{b:2,p:62},{b:4,p:64},{b:5,p:65},{b:6,p:67},
+   {b:8,p:69},{b:10,p:67},{b:12,p:65},{b:14,p:64}]
+    .forEach(({b,p}) => mel.notes.push({beat:b,pitch:p,dur:1.5,vel:80}));
+
+  S.clips = [kick, snare, hh, bass, mel];
+  while (S.clips.length < 8) S.clips.push(mkClip(`clip${S.clips.length + 1}`, 16));
+}
+
+// ------ MIDI / AUDIO -----------------------------------------
+let audioCtx = null;
+
+async function initMIDI() {
+  try {
+    const access = await navigator.requestMIDIAccess();
+    const outs = [...access.outputs.values()];
+    if (outs.length) { S.midiOut = outs[0]; msg(`MIDI → ${S.midiOut.name}`); return; }
+  } catch(e) {}
+  msg('No MIDI — Web Audio fallback');
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function noteOn(pitch, vel, durSec, vol = 1) {
+  const sv = Math.round(vel * vol);
+  if (sv < 1) return;
+  if (S.midiOut) {
+    S.midiOut.send([0x90, pitch, sv]);
+    setTimeout(() => S.midiOut.send([0x80, pitch, 0]), durSec * 1000);
+  } else if (audioCtx) {
+    const osc = audioCtx.createOscillator();
+    const g   = audioCtx.createGain();
+    osc.connect(g); g.connect(audioCtx.destination);
+    osc.frequency.value = 440 * 2 ** ((pitch - 69) / 12);
+    osc.type = pitch < 45 ? 'square' : pitch < 55 ? 'sawtooth' : 'sine';
+    const now = audioCtx.currentTime;
+    g.gain.setValueAtTime(sv / 127 * 0.25, now);
+    g.gain.exponentialRampToValueAtTime(0.0001, now + Math.max(durSec, 0.05));
+    osc.start(now); osc.stop(now + durSec + 0.1);
+  }
+}
+
+function allNotesOff() {
+  if (S.midiOut) for (let ch = 0; ch < 16; ch++) S.midiOut.send([0xB0 | ch, 123, 0]);
+}
+
+// ------ CROSSFADER -------------------------------------------
+function deckVol(di) {
+  return di === 0
+    ? Math.cos(S.fader * Math.PI / 2)
+    : Math.sin(S.fader * Math.PI / 2);
+}
+
+// ------ SCHEDULING -------------------------------------------
+function scheduleNotes() {
+  const LOOK  = 0.25;
+  const until = S.beat + LOOK;
+
+  S.decks.forEach((deck, di) => {
+    const vol = deckVol(di);
+    deck.clips.forEach(ci => {
+      const clip = S.clips[ci];
+      if (!clip?.notes.length) return;
+      const loopStart = Math.floor((S.schedHead - deck.offset) / clip.length);
+      const loopEnd   = Math.floor((until        - deck.offset) / clip.length);
+      for (let loop = loopStart; loop <= loopEnd; loop++) {
+        clip.notes.forEach((n, ni) => {
+          const absB = deck.offset + loop * clip.length + n.beat;
+          if (absB > S.schedHead && absB <= until) {
+            const key = `${clip.id}:${ni}:${loop}`;
+            if (!S.scheduled.has(key)) {
+              S.scheduled.add(key);
+              noteOn(n.pitch, n.vel, (n.dur / S.bpm) * 60, vol);
+            }
+          }
+        });
+      }
+    });
+  });
+  S.schedHead = until;
+}
+
+// ------ CLIP TOGGLE / RETRIGGER ------------------------------
+function toggleClip(ci, di) {
+  if (ci < 0 || ci >= S.clips.length) return;
+  const deck = S.decks[di];
+  const name = S.clips[ci].name;
+  const dl   = di ? 'B' : 'A';
+  if (deck.clips.has(ci)) {
+    deck.clips.delete(ci);
+    msg(`Deck ${dl} − ${name}`);
+  } else {
+    deck.clips.add(ci);
+    deck.offset = S.beat;
+    msg(`Deck ${dl} + ${name}`);
+  }
+}
+
+function retrigger(ci, di) {
+  if (ci < 0 || ci >= S.clips.length) return;
+  S.decks[di].clips.add(ci);
+  S.decks[di].offset = S.beat;
+  msg(`↺ Deck ${di ? 'B' : 'A'} → ${S.clips[ci].name}`);
+}
+
+// ------ LAYOUT HELPERS ---------------------------------------
+function deckH() {
+  return Math.floor((canvas.height - FADER_H - LIB_H - 8) / 2);
+}
+function faderY()  { return deckH() * 2; }
+function libY()    { return faderY() + FADER_H + 4; }
+
+function clipBeat(ci, di) {
+  const deck = S.decks[di];
+  const clip = S.clips[ci];
+  if (!clip) return 0;
+  return ((S.beat - deck.offset) % clip.length + clip.length) % clip.length;
+}
+
+// ------ PITCH RANGE ------------------------------------------
+// Returns the shared pitch range for a deck, derived from all active clips.
+// Pads 2 above and below, clamps to a max of MAX_ROWS rows.
+function deckPitchRange(di) {
+  const deck = S.decks[di];
+  let lo = 60, hi = 72, found = false;
+  deck.clips.forEach(ci => {
+    S.clips[ci]?.notes.forEach(n => {
+      if (!found) { lo = hi = n.pitch; found = true; }
+      else { lo = Math.min(lo, n.pitch); hi = Math.max(hi, n.pitch); }
+    });
+  });
+  lo = Math.max(0,   lo - 2);
+  hi = Math.min(127, hi + 3);
+  // Clamp to MAX_ROWS rows if needed (keep center)
+  if (hi - lo + 1 > MAX_ROWS) {
+    const mid = Math.round((lo + hi) / 2);
+    lo = mid - Math.floor(MAX_ROWS / 2);
+    hi = lo + MAX_ROWS - 1;
+  }
+  return { lo, hi };
+}
+
+// ------ RENDER -----------------------------------------------
+function resize() {
+  canvas.width  = canvas.parentElement.clientWidth;
+  canvas.height = canvas.parentElement.clientHeight;
+}
+
+function render() {
+  const W  = canvas.width;
+  const H  = canvas.height;
+  const dH = deckH();
+  const phX = Math.round(W * PLAYHEAD_X_RATIO);
+
+  ctx.fillStyle = '#080810';
+  ctx.fillRect(0, 0, W, H);
+
+  drawGrid(W, dH * 2, phX);
+
+  for (let d = 0; d < 2; d++) drawDeck(d, d * dH, dH, W, phX);
+
+  drawCrossfader(W, faderY());
+
+  // Playhead (drawn over everything)
+  ctx.strokeStyle = 'rgba(255,68,68,0.12)';
+  ctx.lineWidth = 10;
+  ctx.beginPath(); ctx.moveTo(phX, 0); ctx.lineTo(phX, dH * 2); ctx.stroke();
+  ctx.strokeStyle = '#ff4444';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(phX, 0); ctx.lineTo(phX, dH * 2); ctx.stroke();
+  ctx.fillStyle = '#ff4444';
+  ctx.beginPath();
+  ctx.moveTo(phX - 6, 0); ctx.lineTo(phX + 6, 0); ctx.lineTo(phX, 10);
+  ctx.fill();
+
+  drawLibrary(W, H, libY());
+}
+
+// Beat/bar vertical grid lines
+function drawGrid(W, maxY, phX) {
+  const beatFrac = S.beat % 1;
+  const barFrac  = S.beat % 4;
+  ctx.lineWidth = 1;
+
+  for (let x = phX - beatFrac * PPB; x < W; x += PPB) {
+    ctx.strokeStyle = 'rgba(35,35,65,0.6)';
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, maxY); ctx.stroke();
+  }
+  for (let x = phX - beatFrac * PPB - PPB; x >= 0; x -= PPB) {
+    ctx.strokeStyle = 'rgba(35,35,65,0.6)';
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, maxY); ctx.stroke();
+  }
+  for (let x = phX - barFrac * PPB; x < W; x += 4 * PPB) {
+    ctx.strokeStyle = 'rgba(55,55,95,0.8)';
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, maxY); ctx.stroke();
+  }
+  for (let x = phX - barFrac * PPB - 4 * PPB; x >= 0; x -= 4 * PPB) {
+    ctx.strokeStyle = 'rgba(55,55,95,0.8)';
+    ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, maxY); ctx.stroke();
+  }
+}
+
+function drawDeck(di, y0, dH, W, phX) {
+  const deck  = S.decks[di];
+  const isAct = di === S.activeDeck;
+  const vol   = deckVol(di);
+
+  // Deck background
+  ctx.fillStyle = isAct ? 'rgba(12,18,32,0.97)' : 'rgba(8,12,20,0.97)';
+  ctx.fillRect(0, y0, W, dH);
+
+  // Volume dim overlay
+  if (vol < 0.95) {
+    ctx.fillStyle = `rgba(0,0,0,${(1 - vol) * 0.55})`;
+    ctx.fillRect(0, y0, W, dH);
+  }
+
+  // Deck label strip
+  ctx.fillStyle = '#0c0c1a';
+  ctx.fillRect(0, y0, W, LABEL_H);
+  ctx.font = 'bold 11px monospace';
+  ctx.fillStyle = isAct ? '#7fdbca' : '#2a3040';
+  ctx.fillText(`DECK ${di ? 'B' : 'A'}`, 6, y0 + 12);
+
+  // Note area bounds
+  const naY = y0 + LABEL_H;
+  const naH = dH - LABEL_H;
+
+  if (!deck.clips.size) {
+    ctx.fillStyle = '#1a1a28';
+    ctx.font = '11px monospace';
+    ctx.fillText('— empty —', phX + 14, naY + naH / 2 + 4);
+    return;
+  }
+
+  const { lo, hi } = deckPitchRange(di);
+  const numRows = hi - lo + 1;
+  const rowH    = naH / numRows;
+
+  // Clip to note area so nothing spills into label or adjacent deck
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(0, naY, W, naH);
+  ctx.clip();
+
+  // Piano-roll row backgrounds
+  drawPitchRowBg(lo, hi, naY, rowH, W);
+
+  // Horizontal pitch grid lines
+  drawPitchGridLines(lo, hi, naY, rowH, W);
+
+  // Notes for each clip
+  const clipList = [...deck.clips];
+  const layered  = clipList.length > 1;
+  clipList.forEach(ci => {
+    const clip = S.clips[ci];
+    if (!clip) return;
+    const bInClip = clipBeat(ci, di);
+    const clipX0  = phX - bInClip * PPB;
+    for (let loop = -1; loop <= 3; loop++) {
+      drawClipNotes(clip, lo, hi, naY, rowH, clipX0 + loop * clip.length * PPB, layered);
+    }
+    // Clip loop boundary markers
+    for (let loop = -1; loop <= 3; loop++) {
+      const bx = clipX0 + loop * clip.length * PPB;
+      if (bx >= PIANO_W && bx <= W) {
+        ctx.strokeStyle = 'rgba(100,120,160,0.25)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 5]);
+        ctx.beginPath(); ctx.moveTo(bx, naY); ctx.lineTo(bx, naY + naH); ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+  });
+
+  ctx.restore();
+
+  // Piano key column (drawn after restore so it's always on top of note content)
+  drawPianoKeys(lo, hi, naY, rowH);
+
+  // Clip name tags right of playhead
+  ctx.font = '10px monospace';
+  clipList.forEach((ci, idx) => {
+    const clip = S.clips[ci];
+    if (!clip) return;
+    ctx.fillStyle = isAct ? 'rgba(127,219,202,0.7)' : 'rgba(70,90,110,0.6)';
+    ctx.fillText(clip.name, phX + 8, y0 + 13 + idx * 11);
+  });
+
+  // Edit cursor
+  if (S.mode === 'edit' && deck.clips.has(S.editClip)) {
+    const clip    = S.clips[S.editClip];
+    const bInClip = clipBeat(S.editClip, di);
+    const clipX0  = phX - bInClip * PPB;
+    drawEditCursor(lo, hi, naY, rowH, clipX0);
+  }
+}
+
+// ------ PIANO ROLL PRIMITIVES --------------------------------
+
+function drawPitchRowBg(lo, hi, naY, rowH, W) {
+  for (let p = lo; p <= hi; p++) {
+    if (BLACK_KEYS.has(p % 12)) {
+      ctx.fillStyle = 'rgba(0,0,8,0.28)';
+      const y = naY + (hi - p) * rowH;
+      ctx.fillRect(PIANO_W, y, W - PIANO_W, rowH);
+    }
+  }
+}
+
+function drawPitchGridLines(lo, hi, naY, rowH, W) {
+  for (let p = lo; p <= hi; p++) {
+    const y  = naY + (hi - p) * rowH;
+    const pc = p % 12;
+    const isC = pc === 0;
+    const isF = pc === 5; // F is another natural landmark
+
+    ctx.strokeStyle = isC  ? 'rgba(90,90,150,0.6)' :
+                      isF  ? 'rgba(55,55,100,0.35)' :
+                             'rgba(35,35,70,0.3)';
+    ctx.lineWidth   = isC ? 1 : 0.5;
+    ctx.beginPath(); ctx.moveTo(PIANO_W, y); ctx.lineTo(W, y); ctx.stroke();
+
+    // Octave label (C notes only, when rows are tall enough)
+    if (isC && rowH >= 7) {
+      ctx.fillStyle = 'rgba(90,90,160,0.55)';
+      ctx.font = '7px monospace';
+      ctx.fillText(`C${Math.floor(p / 12) - 1}`, PIANO_W + 2, y + rowH - 2);
+    }
+  }
+  // Bottom edge
+  const bottomY = naY + (hi - lo + 1) * rowH;
+  ctx.strokeStyle = 'rgba(35,35,70,0.3)';
+  ctx.lineWidth = 0.5;
+  ctx.beginPath(); ctx.moveTo(PIANO_W, bottomY); ctx.lineTo(W, bottomY); ctx.stroke();
+}
+
+function drawPianoKeys(lo, hi, naY, rowH) {
+  for (let p = lo; p <= hi; p++) {
+    const y     = naY + (hi - p) * rowH;
+    const isBlk = BLACK_KEYS.has(p % 12);
+
+    ctx.fillStyle   = isBlk ? '#0d0d18' : '#1a1a28';
+    ctx.fillRect(0, y + 0.5, PIANO_W - 2, Math.max(rowH - 0.5, 0.5));
+
+    // Subtle separator between keys
+    ctx.strokeStyle = '#222230';
+    ctx.lineWidth   = 0.5;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(PIANO_W - 2, y); ctx.stroke();
+  }
+  // Vertical right border of key column
+  ctx.strokeStyle = '#2a2a40';
+  ctx.lineWidth   = 1;
+  ctx.beginPath();
+  ctx.moveTo(PIANO_W - 1, naY);
+  ctx.lineTo(PIANO_W - 1, naY + (hi - lo + 1) * rowH);
+  ctx.stroke();
+}
+
+function drawClipNotes(clip, lo, hi, naY, rowH, clipX0, layered) {
+  clip.notes.forEach(n => {
+    if (n.pitch < lo || n.pitch > hi) return;
+    const x  = clipX0 + n.beat * PPB;
+    const w  = Math.max(2, n.dur * PPB - 1);
+    const y  = naY + (hi - n.pitch) * rowH;
+    const nH = Math.max(2, rowH - 1);
+
+    ctx.globalAlpha = layered ? 0.82 : 1.0;
+    ctx.fillStyle   = NOTE_COLS[n.pitch % 12];
+    ctx.fillRect(x, y + 0.5, w, nH - 0.5);
+
+    // Velocity highlight — bright strip at top of note
+    ctx.fillStyle = `rgba(255,255,255,${(n.vel / 127) * 0.28})`;
+    ctx.fillRect(x, y + 0.5, w, Math.max(1, (nH - 0.5) / 3));
+
+    ctx.globalAlpha = 1.0;
+  });
+}
+
+function drawEditCursor(lo, hi, naY, rowH, clipX0) {
+  if (S.curPitch < lo || S.curPitch > hi) return;
+  const cx  = clipX0 + S.curBeat * PPB;
+  const cy  = naY + (hi - S.curPitch) * rowH;
+  const cH  = Math.max(2, rowH - 1);
+  const cW  = Math.max(4, S.quantize * PPB);
+
+  ctx.strokeStyle = 'rgba(255,255,80,0.9)';
+  ctx.lineWidth   = 2;
+  ctx.strokeRect(cx - 1, cy - 1, cW + 2, cH + 2);
+
+  if (rowH >= 8) {
+    ctx.fillStyle = 'rgba(255,255,80,0.75)';
+    ctx.font = '8px monospace';
+    ctx.fillText(midiName(S.curPitch), cx + 2, cy - 2);
+  }
+}
+
+// ------ CROSSFADER -------------------------------------------
+function drawCrossfader(W, y0) {
+  const pad    = 60;
+  const trackW = W - pad * 2;
+  const trackY = y0 + Math.floor(FADER_H / 2);
+  const hndX   = pad + Math.round(S.fader * trackW);
+
+  ctx.fillStyle = '#0a0a16';
+  ctx.fillRect(0, y0, W, FADER_H);
+  ctx.strokeStyle = '#18182a'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, y0);        ctx.lineTo(W, y0);        ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(0, y0+FADER_H); ctx.lineTo(W, y0+FADER_H); ctx.stroke();
+
+  ctx.font = 'bold 10px monospace';
+  ctx.fillStyle = S.fader < 0.05 ? '#7fdbca' : '#2a3a40';
+  ctx.fillText('A', pad - 22, trackY + 4);
+  ctx.fillStyle = S.fader > 0.95 ? '#da70d6' : '#2a2040';
+  ctx.fillText('B', W - pad + 10, trackY + 4);
+
+  // Track
+  ctx.fillStyle = '#161626';
+  ctx.fillRect(pad, trackY - 2, trackW, 4);
+
+  // A fill (teal)
+  const aW = hndX - pad;
+  if (aW > 0) {
+    ctx.fillStyle = `rgba(127,219,202,${0.12 + (1 - S.fader) * 0.45})`;
+    ctx.fillRect(pad, trackY - 2, aW, 4);
+  }
+  // B fill (purple)
+  const bW = pad + trackW - hndX;
+  if (bW > 0) {
+    ctx.fillStyle = `rgba(218,112,214,${0.12 + S.fader * 0.45})`;
+    ctx.fillRect(hndX, trackY - 2, bW, 4);
+  }
+
+  // Handle
+  ctx.fillStyle   = '#222238';
+  ctx.strokeStyle = '#5050a0';
+  ctx.lineWidth   = 1;
+  ctx.fillRect(hndX - 7, trackY - 10, 14, 20);
+  ctx.strokeRect(hndX - 7, trackY - 10, 14, 20);
+  ctx.strokeStyle = '#7070b0'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(hndX, trackY - 6); ctx.lineTo(hndX, trackY + 6); ctx.stroke();
+
+  // Vol %
+  ctx.font = '9px monospace'; ctx.fillStyle = '#334455';
+  ctx.fillText(`${Math.round(deckVol(0) * 100)}%`, pad - 44, trackY + 4);
+  ctx.textAlign = 'right';
+  ctx.fillText(`${Math.round(deckVol(1) * 100)}%`, W - pad + 42, trackY + 4);
+  ctx.textAlign = 'left';
+}
+
+// ------ LIBRARY ----------------------------------------------
+function drawLibrary(W, H, y0) {
+  const libH  = H - y0;
+  const slotW = Math.floor(W / 8);
+
+  ctx.fillStyle = '#080812';
+  ctx.fillRect(0, y0, W, libH);
+
+  S.clips.slice(0, 8).forEach((clip, i) => {
+    const x   = i * slotW;
+    const onA = S.decks[0].clips.has(i);
+    const onB = S.decks[1].clips.has(i);
+    const ed  = S.editClip === i && S.mode === 'edit';
+
+    ctx.fillStyle = ed       ? '#1a1a08' :
+                    onA&&onB ? '#0c1c1e' :
+                    onA      ? '#091220' :
+                    onB      ? '#10082a' : '#0a0a14';
+    ctx.fillRect(x + 1, y0, slotW - 2, libH - 1);
+
+    ctx.strokeStyle = ed  ? '#78780e' : onA ? '#346858' : onB ? '#683468' : '#16162a';
+    ctx.lineWidth = 1;
+    ctx.strokeRect(x + 1, y0, slotW - 2, libH - 1);
+
+    ctx.font = 'bold 10px monospace';
+    ctx.fillStyle = '#404050';
+    ctx.fillText(`[${i+1}]`, x + 4, y0 + 12);
+
+    ctx.font = '10px monospace';
+    ctx.fillStyle = clip.notes.length ? '#9898b0' : '#242434';
+    ctx.fillText(clip.name.slice(0, 6), x + 4, y0 + 23);
+
+    // Deck badges
+    let bx = x + slotW - 12;
+    if (onB) { ctx.fillStyle = '#da70d6'; ctx.font = 'bold 9px monospace'; ctx.fillText('B', bx, y0 + 12); bx -= 10; }
+    if (onA) { ctx.fillStyle = '#7fdbca'; ctx.font = 'bold 9px monospace'; ctx.fillText('A', bx, y0 + 12); }
+
+    // Mini note map
+    if (clip.notes.length) {
+      const mY = y0 + libH - 14;
+      const mW = slotW - 8;
+      ctx.fillStyle = '#0e0e1c';
+      ctx.fillRect(x + 4, mY, mW, 10);
+      clip.notes.forEach(n => {
+        const nx = x + 4 + (n.beat / clip.length) * mW;
+        const nw = Math.max(1, (n.dur  / clip.length) * mW);
+        ctx.fillStyle = NOTE_COLS[n.pitch % 12];
+        ctx.fillRect(nx, mY + 1, nw, 8);
+      });
+    }
+  });
+}
+
+// ------ MAIN LOOP --------------------------------------------
+function mainLoop(ts) {
+  if (S.playing && S.lastTs !== null) {
+    S.beat += (ts - S.lastTs) * (S.bpm / 60000);
+    scheduleNotes();
+  }
+  S.lastTs = S.playing ? ts : null;
+  render();
+  updateHUD();
+  requestAnimationFrame(mainLoop);
+}
+
+// ------ HUD --------------------------------------------------
+function updateHUD() {
+  document.getElementById('s-mode').textContent = S.mode.toUpperCase();
+  document.getElementById('s-bpm').textContent  = `${S.bpm} BPM`;
+  const an = [...S.decks[0].clips].map(i => S.clips[i]?.name).join('+') || '---';
+  const bn = [...S.decks[1].clips].map(i => S.clips[i]?.name).join('+') || '---';
+  document.getElementById('s-decks').textContent = `A:[${an}]  B:[${bn}]`;
+  document.getElementById('s-beat').textContent  = S.playing ? S.beat.toFixed(2) : '--';
+  document.getElementById('s-rec').style.display = S.recording ? '' : 'none';
+
+  document.getElementById('cmd-prefix').textContent =
+    S.mode === 'command' ? ':' :
+    S.mode === 'edit'    ? '-- EDIT --' :
+    S.mode === 'record'  ? '-- RECORD --' : '-- PERFORM --';
+  document.getElementById('cmd-text').textContent = S.cmdBuf;
+}
+
+let _msgTimer = null;
+function msg(text) {
+  document.getElementById('cmd-text').textContent = text;
+  if (_msgTimer) clearTimeout(_msgTimer);
+  _msgTimer = setTimeout(() => {
+    document.getElementById('cmd-text').textContent = S.cmdBuf;
+  }, 2500);
+}
+
+// ------ KEYBOARD ---------------------------------------------
+const QKEYS = { q:0, w:1, e:2, r:3, t:4, y:5, u:6, i:7 };
+
+document.addEventListener('keydown', ev => {
+  if (ev.metaKey || ev.ctrlKey) return;
+  ev.preventDefault();
+
+  if (S.mode === 'command') { handleCmd(ev); return; }
+
+  const k  = ev.key;
+  const sh = ev.shiftKey;
+
+  if (S.mode === 'edit' && handleEditKey(k, sh)) return;
+
+  switch (k) {
+    case ' ':
+      if (S.playing) {
+        S.playing = false; S.lastTs = null; allNotesOff(); msg('Stopped');
+      } else {
+        if (audioCtx?.state === 'suspended') audioCtx.resume();
+        S.schedHead = S.beat; S.scheduled.clear(); S.playing = true; msg('Playing');
+      }
+      break;
+
+    case 'r': case 'R':
+      S.recording = !S.recording;
+      S.mode = S.recording ? 'record' : 'perform';
+      msg(S.recording ? 'Recording...' : 'Record off');
+      break;
+
+    case 'Tab':
+      S.activeDeck = 1 - S.activeDeck;
+      msg(`Active: Deck ${S.activeDeck ? 'B' : 'A'}`);
+      break;
+
+    case 'a':
+      S.fader = 0; msg('Crossfader → A');
+      break;
+    case 'b':
+      S.fader = 1; msg('Crossfader → B');
+      break;
+    case 'f':
+      S.fader = 0.5; msg('Crossfader center');
+      break;
+
+    case 'e':
+      if (!sh) {
+        S.mode = 'edit';
+        const first = [...S.decks[S.activeDeck].clips][0];
+        S.editClip = first ?? 0;
+        // Center cursor pitch on the clip's note range
+        const { lo, hi } = deckPitchRange(S.activeDeck);
+        S.curPitch = Math.round((lo + hi) / 2);
+        S.curBeat  = 0;
+        msg(`Edit: ${S.clips[S.editClip]?.name}`);
+      }
+      break;
+
+    case 'Escape':
+      S.mode = 'perform'; S.cmdBuf = ''; msg('Perform');
+      break;
+
+    case 'n':
+      if (!sh) {
+        const nc = mkClip(`clip${S.clips.length + 1}`, 16);
+        S.clips.push(nc);
+        msg(`New: ${nc.name} (slot ${S.clips.length})`);
+      }
+      break;
+
+    case ':':
+      S.mode = 'command'; S.cmdBuf = '';
+      break;
+
+    case '<': case ',':
+      S.bpm = Math.max(40, S.bpm - 5); msg(`BPM ${S.bpm}`);
+      break;
+    case '>': case '.':
+      S.bpm = Math.min(300, S.bpm + 5); msg(`BPM ${S.bpm}`);
+      break;
+
+    case '-':
+      S.fader = Math.max(0, S.fader - 0.05);
+      msg(`Fader ${Math.round(S.fader * 100)}%`);
+      break;
+    case '=': case '+':
+      S.fader = Math.min(1, S.fader + 0.05);
+      msg(`Fader ${Math.round(S.fader * 100)}%`);
+      break;
+
+    case '?': showHelp(); break;
+
+    default:
+      if (k >= '1' && k <= '8') {
+        const ci = +k - 1;
+        if (ci < S.clips.length) toggleClip(ci, sh ? 1 : S.activeDeck);
+        break;
+      }
+      if (k in QKEYS && !sh) {
+        const ci = QKEYS[k];
+        if (ci < S.clips.length) retrigger(ci, S.activeDeck);
+      }
+  }
+});
+
+function handleEditKey(k, sh) {
+  const clip = S.clips[S.editClip];
+  if (!clip) return false;
+
+  switch (k) {
+    case 'h': case 'ArrowLeft':
+      S.curBeat = Math.max(0, S.curBeat - S.quantize); return true;
+    case 'l': case 'ArrowRight':
+      S.curBeat = Math.min(clip.length - S.quantize, S.curBeat + S.quantize); return true;
+    case 'j': case 'ArrowDown':
+      S.curPitch = Math.max(0,   S.curPitch - (sh ? 12 : 1)); return true;
+    case 'k': case 'ArrowUp':
+      S.curPitch = Math.min(127, S.curPitch + (sh ? 12 : 1)); return true;
+
+    case 'a': {
+      clip.notes.push({ beat: S.curBeat, pitch: S.curPitch, dur: S.quantize, vel: 100 });
+      clip.notes.sort((a, b) => a.beat - b.beat);
+      noteOn(S.curPitch, 100, (S.quantize / S.bpm) * 60);
+      S.curBeat = Math.min(clip.length - S.quantize, S.curBeat + S.quantize);
+      msg(`+ ${midiName(S.curPitch)} @ ${S.curBeat.toFixed(2)}`);
+      return true;
+    }
+    case 'x': case 'Delete': {
+      const before = clip.notes.length;
+      clip.notes = clip.notes.filter(n =>
+        !(Math.abs(n.beat - S.curBeat) < S.quantize / 2 + 0.001 && n.pitch === S.curPitch)
+      );
+      msg(clip.notes.length < before ? 'Note deleted' : 'Nothing at cursor');
+      return true;
+    }
+    case '[':
+      S.quantize = Math.max(0.0625, S.quantize / 2);
+      msg(`Q: 1/${Math.round(1 / S.quantize)}`); return true;
+    case ']':
+      S.quantize = Math.min(4, S.quantize * 2);
+      msg(`Q: ${S.quantize >= 1 ? S.quantize : '1/' + Math.round(1 / S.quantize)}`); return true;
+
+    case 'Escape':
+      S.mode = 'perform'; msg('Perform'); return true;
+  }
+  return false;
+}
+
+function handleCmd(ev) {
+  if (ev.key === 'Escape')    { S.mode = 'perform'; S.cmdBuf = ''; return; }
+  if (ev.key === 'Backspace') { S.cmdBuf = S.cmdBuf.slice(0, -1); if (!S.cmdBuf) S.mode = 'perform'; return; }
+  if (ev.key === 'Enter')     { execCmd(S.cmdBuf); S.cmdBuf = ''; S.mode = 'perform'; return; }
+  if (ev.key.length === 1)    S.cmdBuf += ev.key;
+  updateHUD();
+}
+
+function execCmd(raw) {
+  const [verb, ...args] = raw.trim().split(/\s+/);
+  switch ((verb || '').toLowerCase()) {
+    case 'bpm': { const v = +args[0]; if (v > 0 && v < 400) { S.bpm = v; msg(`BPM ${v}`); } break; }
+    case 'new': { S.clips.push(mkClip(args[0] || `clip${S.clips.length+1}`, +args[1]||16)); msg(`Created`); break; }
+    case 'len': case 'length': {
+      const ci = +args[0]-1, len = +args[1];
+      if (ci >= 0 && ci < S.clips.length && len > 0) { S.clips[ci].length = len; msg(`Clip ${ci+1} len=${len}`); }
+      break;
+    }
+    case 'clear': {
+      const ci = +args[0]-1;
+      if (ci >= 0 && ci < S.clips.length) { S.clips[ci].notes = []; msg(`Cleared ${ci+1}`); }
+      break;
+    }
+    case 'rename': {
+      const ci = +args[0]-1;
+      if (ci >= 0 && ci < S.clips.length && args[1]) { S.clips[ci].name = args[1]; msg('Renamed'); }
+      break;
+    }
+    default: msg(`?${verb}`);
+  }
+}
+
+// ------ HELP -------------------------------------------------
+const HELP = `TRIG SEQ  —  key bindings
+───────────────────────────────────────────────────────
+SPACE          Play / Stop
+R              Toggle record
+TAB            Switch active deck (A ↔ B)
+< / >          BPM − 5 / + 5
+
+1 – 8          Toggle clip on active deck (add/remove)
+SHIFT + 1–8    Toggle clip on Deck B
+Q W E R T Y U I   Retrigger clip 1–8 → active deck
+                   (adds clip + resets loop phase)
+
+A              Crossfader snap → full Deck A
+B              Crossfader snap → full Deck B
+F              Crossfader center (50/50)
+- / =          Nudge crossfader left / right
+
+N              New empty clip
+E              Enter Edit mode
+ESC            Exit to Perform mode
+
+Edit mode:
+  H / L        Cursor left / right  (by quantize step)
+  J / K        Cursor pitch down / up  (SHIFT = octave)
+  A            Add note at cursor  (advances cursor)
+  X            Delete note at cursor
+  [ / ]        Halve / double quantize step
+
+  The pitch grid auto-fits to the deck's note range.
+  Layer clips with 1-8 to see them on the shared grid.
+
+Command mode  (press :)
+  :bpm 140     Set BPM
+  :new kick 32 New 32-beat clip "kick"
+  :len 2 32    Set clip 2 length to 32 beats
+  :clear 3     Clear notes from clip 3
+  :rename 2 bass
+
+Click anywhere to dismiss`;
+
+function showHelp() {
+  const el = document.createElement('div');
+  el.style.cssText = `
+    position:fixed; inset:0; background:rgba(0,0,0,0.9);
+    color:#b0b0c0; font:13px/1.75 'Courier New',monospace;
+    display:flex; align-items:center; justify-content:center;
+    z-index:999; cursor:pointer; white-space:pre;
+  `;
+  el.textContent = HELP;
+  el.onclick = () => el.remove();
+  document.body.appendChild(el);
+}
+
+// ------ UTILS ------------------------------------------------
+function midiName(n) {
+  return ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][n % 12] + (Math.floor(n / 12) - 1);
+}
+
+// ------ BOOT -------------------------------------------------
+function init() {
+  resize();
+  window.addEventListener('resize', resize);
+  initClips();
+  initMIDI();
+  requestAnimationFrame(mainLoop);
+  setTimeout(() => msg('TRIG SEQ — SPACE to play · ? for help'), 500);
+}
+
+init();
+</script>
+</body>
+</html>
